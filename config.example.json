@@ -1,0 +1,11 @@
+{
+  "max_price": 1200,
+  "center": "Zürich HB",
+  "radius_km": 5,
+  "min_distance_km": 0,
+  "interval_minutes": 30,
+  "furnished": false,
+  "sources": ["flatfox", "wgzimmer"],
+  "wgzimmer_regions": ["zurich-stadt", "zurich"],
+  "output_dir": "data"
+}

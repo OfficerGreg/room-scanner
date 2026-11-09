@@ -3,7 +3,7 @@ name: Scan rooms
 on:
   schedule:
     # Every 30 minutes, offset from the busiest minute of the hour (UTC).
-    - cron: '0,* * * * *'
+    - cron: '7,37 * * * *'
   workflow_dispatch:
 
 permissions:

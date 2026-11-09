@@ -1,7 +1,8 @@
 {
-  "max_price": 1200,
-  "center": "Zürich HB",
-  "radius_km": 5,
+  "max_price": 800,
+  "center": "Bucheggstrasse 10, Zürich",
+  "radius_km": 1,
+  "preferred_address": "Bucheggstrasse 4-12",
   "min_distance_km": 0,
   "interval_minutes": 30,
   "furnished": false,

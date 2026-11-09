@@ -1,6 +1,7 @@
 import copy
 import io
 from pathlib import Path
+import re
 import ssl
 import tempfile
 import unittest
@@ -17,7 +18,7 @@ ID = "11111111-2222-3333-4444-555555555555"
 ID2 = "66666666-2222-3333-4444-555555555555"
 ENTRY = {"pk": ID, "url": wg.BASE + "/wglink/en/" + ID}
 
-# Synthetic fixtures using wgzimmer's public search-mate-entry and strong-label structure.
+# Legacy fixtures kept to verify compatibility with older listing pages.
 SEARCH = '''<html><body><span>Total 1</span><span>Page 1/1</span><ul>
 <li class="search-result-entry search-mate-entry"><a href="/wglink/en/{id}">Room</a>
 <div class="cost">CHF 999.-</div></li></ul></body></html>'''.format(id=ID)
@@ -27,6 +28,9 @@ DETAIL = '''<html><head><meta property="og:title" content="WG-Zimmer Zürich"></
 <div class="adress-region"><p><strong>Address:</strong> Langstrasse 120</p>
 <p><strong>City:</strong> 8004 Zürich</p></div><p><strong>Furnished:</strong> Yes</p>
 <a href="https://maps.google.com/?q=47.378178,8.540218">Google Maps</a></body></html>'''
+FIXTURES = Path(__file__).parent / "fixtures"
+CURRENT_SEARCH = (FIXTURES / "wgzimmer-search.html").read_text(encoding="utf-8")
+CURRENT_DETAIL = (FIXTURES / "wgzimmer-detail.html").read_text(encoding="utf-8")
 
 
 class Client:
@@ -46,6 +50,14 @@ class Client:
 
 
 class WGZimmerTests(unittest.TestCase):
+    def setUp(self):
+        self.ntfy = patch.object(scanner, "settings_from_env", return_value=None)
+        self.ntfy.start()
+        self.addCleanup(self.ntfy.stop)
+
+    def options(self, argv):
+        return scanner.parse_args(["--max-price", "1200", "--radius-km", "5"] + argv)
+
     def test_search_and_detail_parse_expected_labels(self):
         entries, next_url, count = wg.parse_search(SEARCH)
         self.assertEqual((len(entries), next_url, count), (1, None, 1))
@@ -55,7 +67,7 @@ class WGZimmerTests(unittest.TestCase):
         self.assertEqual(listing["moving_date"], "2026-12-01")
         self.assertIs(listing["is_furnished"], True)
         self.assertIs(listing["is_temporary"], False)
-        matches, _ = scanner.filter_listings([listing], scanner.parse_args([]), *CENTER[:2])
+        matches, _ = scanner.filter_listings([listing], self.options([]), *CENTER[:2])
         self.assertEqual(matches[0]["id"], "wgzimmer:" + ID)
         self.assertEqual(matches[0]["price_basis"], "advertised_monthly")
 
@@ -82,19 +94,87 @@ class WGZimmerTests(unittest.TestCase):
         first += '<a class="next" href="/en/wgzimmer/search/mate.html?page=2">Next</a>'
         second = SEARCH.replace(ID, ID2).replace("Total 1", "Total 2").replace("Page 1/1", "Page 2/2")
         client = Client([first, second, SEARCH, DETAIL, DETAIL])
-        options = scanner.parse_args([])
+        options = self.options([])
         listings, stats = wg.fetch_wgzimmer(client, options, {})
         self.assertEqual(len(listings), 2)
         self.assertEqual(stats["candidate_count"], 2)
         self.assertEqual(len(client.urls), 5)
-        self.assertEqual(parse_qs(urlparse(client.urls[0]).query)["wgState"], ["zurich-stadt"])
-        self.assertEqual(parse_qs(urlparse(client.urls[2]).query)["wgState"], ["zurich"])
+        self.assertEqual(parse_qs(urlparse(client.urls[0]).query)["region"], ["zuerich"])
+        self.assertEqual(parse_qs(urlparse(client.urls[2]).query)["region"], ["kanton-zuerich"])
+
+    def test_current_queries_use_supported_filters_and_region_aliases(self):
+        for region, expected in (("zurich-stadt", "zuerich"), ("zurich", "kanton-zuerich"),
+                                 ("zuerich", "zuerich"), ("winterthur", "winterthur")):
+            client = Client(["<span>Total 0</span>"])
+            options = self.options(["--wgzimmer-regions", region, "--max-price", "800.5", "--furnished"])
+            wg.fetch_wgzimmer(client, options, {})
+            self.assertEqual(parse_qs(urlparse(client.urls[0]).query),
+                             {"region": [expected], "min": ["0"], "max": ["801"], "moebliert": ["ja"]})
+
+    def test_current_search_reads_full_id_short_link_and_next_page(self):
+        entries, next_url, count = wg.parse_search(CURRENT_SEARCH)
+        self.assertEqual(count, 110)
+        self.assertEqual(entries, [{"pk": "2feafb66-c53d-4bcc-bdd9-8f7871ea0452",
+                                   "url": wg.BASE + "/en/wg-zimmer/zuerich/8050-zuerich-2feafb66.html"}])
+        self.assertEqual(parse_qs(urlparse(next_url).query),
+                         {"region": ["zuerich"], "max": ["800"], "seite": ["2"]})
+        without_rel_next = CURRENT_SEARCH.replace('rel="next"', '').replace('Next ›', 'More')
+        self.assertEqual(wg.parse_search(without_rel_next)[1], next_url)
+        self.assertEqual(wg.parse_search('<p class="search__count">0 ads</p>'), ([], None, 0))
+
+    def test_current_search_rejects_wanted_ads_missing_ids_and_external_links(self):
+        for page in (CURRENT_SEARCH.replace('/en/wg-zimmer/', '/en/wg-suche/'),
+                     CURRENT_SEARCH.replace('data-ad-id="2feafb66-c53d-4bcc-bdd9-8f7871ea0452"', ''),
+                     CURRENT_SEARCH.replace('href="/en/wg-zimmer/', 'href="https://example.com/en/wg-zimmer/')):
+            with self.assertRaises(wg.WGZimmerError):
+                wg.parse_search(page)
+
+    def test_current_detail_reads_facts_rent_and_approximate_map(self):
+        entry = wg.parse_search(CURRENT_SEARCH)[0][0]
+        listing = wg.parse_detail(CURRENT_DETAIL, entry)
+        self.assertEqual(listing["advertised_monthly_rent"], 659)
+        self.assertEqual(listing["public_address"], "Hagenholzstrasse, 8050 Zürich")
+        self.assertEqual(listing["moving_date"], "2027-01-01")
+        self.assertIs(listing["is_temporary"], False)
+        self.assertIs(listing["is_furnished"], False)
+        self.assertEqual((listing["latitude"], listing["longitude"]), (47.4147, 8.5605))
+        self.assertEqual(listing["location_accuracy"], "advertised_approximate")
+        studio = wg.parse_detail(CURRENT_DETAIL.replace('<dd>Flat share</dd>', '<dd>Studio</dd>'), entry)
+        self.assertEqual(scanner.filter_listings([studio], self.options([]), 47.4147, 8.5605)[0], [])
+
+    def test_ignored_query_filters_fail_instead_of_searching_all_switzerland(self):
+        wg.validate_search_filters(CURRENT_SEARCH, "zuerich", 800, False)
+        checked = CURRENT_SEARCH.replace('name="moebliert" value="ja"', 'name="moebliert" value="ja" checked')
+        wg.validate_search_filters(checked, "zuerich", 800, True)
+        no_form = re.sub(r"<form.*?</form>", "", CURRENT_SEARCH, flags=re.S)
+        with self.assertRaises(wg.WGZimmerError):
+            wg.validate_search_filters(no_form, "zuerich", 800, False)
+        for region, price, furnished in (("kanton-zuerich", 800, False), ("zuerich", 900, False),
+                                          ("zuerich", 800, True)):
+            with self.assertRaises(wg.WGZimmerError):
+                wg.validate_search_filters(CURRENT_SEARCH, region, price, furnished)
+
+    def test_current_pages_keep_filters_and_fetch_each_detail_once(self):
+        first = CURRENT_SEARCH.replace('110', '2')
+        second = first.replace('2feafb66-c53d-4bcc-bdd9-8f7871ea0452', ID2).replace('2feafb66.html', '66666666.html')
+        second = second.replace('rel="next"', '').replace('Next ›', 'Previous')
+        second = second.replace('data-next-page="/en/wgzimmer/search/mate.html?region=zuerich&amp;max=800&amp;seite=2"', '')
+        client = Client([first, second, CURRENT_DETAIL, CURRENT_DETAIL])
+        options = self.options(["--wgzimmer-regions", "zurich-stadt", "--max-price", "800"])
+        listings, stats = wg.fetch_wgzimmer(client, options, {})
+        self.assertEqual(len(listings), 2)
+        self.assertEqual(stats["unknown_location_count"], 0)
+        self.assertEqual(client.geo_calls, 0)
+        self.assertEqual(parse_qs(urlparse(client.urls[1]).query)["seite"], ["2"])
+        stripped_filters = second.replace('value="zuerich" selected', 'value="zuerich"')
+        with self.assertRaises(wg.WGZimmerError):
+            wg.fetch_wgzimmer(Client([first, stripped_filters]), options, {})
 
     def test_missing_next_page_and_repeated_pagination_fail(self):
         with self.assertRaises(wg.WGZimmerError):
             wg.parse_search(SEARCH.replace("Page 1/1", "Page 1/2"))
         repeated = SEARCH + '<a class="next" href="/en/wgzimmer/search/mate.html?page=2">Next</a>'
-        options = scanner.parse_args(["--wgzimmer-regions", "zurich-stadt"])
+        options = self.options(["--wgzimmer-regions", "zurich-stadt"])
         with self.assertRaises(wg.WGZimmerError):
             wg.fetch_wgzimmer(Client([repeated, repeated]), options, {})
 
@@ -124,7 +204,7 @@ class WGZimmerTests(unittest.TestCase):
     def test_no_city_centroid_fallback_for_radius_filter(self):
         detail = DETAIL.replace('q=47.378178,8.540218', 'q=Langstrasse')
         client = Client([SEARCH, detail], geo={"results": []})
-        options = scanner.parse_args(["--wgzimmer-regions", "zurich-stadt"])
+        options = self.options(["--wgzimmer-regions", "zurich-stadt"])
         listings, stats = wg.fetch_wgzimmer(client, options, {})
         self.assertEqual(stats["unknown_location_count"], 1)
         self.assertEqual(scanner.filter_listings(listings, options, *CENTER[:2])[0], [])
@@ -137,16 +217,16 @@ class WGZimmerTests(unittest.TestCase):
             self.assertEqual(request.call_count, 1)
 
     def test_source_selection_config_and_invalid_sources(self):
-        self.assertEqual(scanner.parse_args(["--sources", "wgzimmer"]).sources, ["wgzimmer"])
-        self.assertEqual(scanner.parse_args(["--sources", "wgzimmer,flatfox,wgzimmer"]).sources,
+        self.assertEqual(self.options(["--sources", "wgzimmer"]).sources, ["wgzimmer"])
+        self.assertEqual(self.options(["--sources", "wgzimmer,flatfox,wgzimmer"]).sources,
                          ["wgzimmer", "flatfox"])
         for value in ("unknown", "", "wgzimmer,,flatfox"):
             with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
-                scanner.parse_args(["--sources", value])
+                self.options(["--sources", value])
 
     def test_one_failed_source_exports_partial_results(self):
         with tempfile.TemporaryDirectory() as directory:
-            options = scanner.parse_args(["--output-dir", directory])
+            options = self.options(["--output-dir", directory])
             with patch.object(scanner, "fetch_pins", return_value=[{"pk": 123}]):
                 with patch.object(scanner, "fetch_details", return_value=[ROOM]):
                     with patch.object(scanner, "fetch_wgzimmer", side_effect=wg.WGZimmerError("challenge")):
@@ -160,7 +240,7 @@ class WGZimmerTests(unittest.TestCase):
 
     def test_wgzimmer_works_when_flatfox_fails(self):
         with tempfile.TemporaryDirectory() as directory:
-            options = scanner.parse_args(["--output-dir", directory])
+            options = self.options(["--output-dir", directory])
             listings = [wg.parse_detail(DETAIL, ENTRY)]
             stats = {"candidate_count": 1, "details_count": 1, "unavailable_details_count": 0,
                      "unknown_location_count": 0}
@@ -173,8 +253,8 @@ class WGZimmerTests(unittest.TestCase):
 
     def test_old_flatfox_seen_history_is_preserved_when_enabling_wgzimmer(self):
         with tempfile.TemporaryDirectory() as directory:
-            flatfox = scanner.parse_args(["--sources", "flatfox", "--output-dir", directory])
-            both = scanner.parse_args(["--output-dir", directory])
+            flatfox = self.options(["--sources", "flatfox", "--output-dir", directory])
+            both = self.options(["--output-dir", directory])
             matches, _ = scanner.filter_listings([ROOM], flatfox, *CENTER[:2])
             metadata = {"scanned_at": "2026-11-09T09:00:00+00:00", "complete": True}
             self.assertEqual(scanner.save_results(flatfox, CENTER, copy.deepcopy(matches), metadata)["new_count"], 1)
@@ -185,7 +265,7 @@ class WGZimmerTests(unittest.TestCase):
 
     def test_partial_one_shot_scan_returns_distinct_exit_code(self):
         with patch.object(scanner, "scan", return_value={"complete": False}):
-            self.assertEqual(scanner.main(["scan"]), 2)
+            self.assertEqual(scanner.main(["scan", "--center", "Zürich HB"]), 2)
 
 
 if __name__ == "__main__":

@@ -32,8 +32,60 @@ class StubClient:
 
 
 class ScannerTests(unittest.TestCase):
+    def setUp(self):
+        self.ntfy = patch.object(scanner, "settings_from_env", return_value=None)
+        self.ntfy.start()
+        self.addCleanup(self.ntfy.stop)
+
     def options(self, *args):
-        return scanner.parse_args(list(args))
+        return scanner.parse_args(["--max-price", "1200", "--radius-km", "5"] + list(args))
+
+    def test_defaults_focus_on_bucheggstrasse_with_800_cap(self):
+        options = scanner.parse_args([])
+        self.assertEqual(options.center, "Bucheggstrasse 10, Zürich")
+        self.assertEqual(options.max_price, 800)
+        self.assertEqual(options.radius_km, 1)
+        self.assertEqual(options.preferred_address, "Bucheggstrasse 4-12")
+
+    def test_preference_matches_only_the_street_and_house_range(self):
+        for address in ("Bucheggstrasse 4, 8037 Zürich", "BUCHEGGSTRASSE 10, Zurich",
+                        "Bucheggstrasse 12", "Bucheggstrasse 4–12, Zürich"):
+            self.assertTrue(scanner.is_preferred_address(address, "Bucheggstrasse 4-12"), address)
+        for address in ("Bucheggstrasse 3", "Bucheggstrasse 14", "Bucheggstrasse 100",
+                        "Andere Bucheggstrasse 10", "8037 Zürich", "Bucheggstrasse 4-14"):
+            self.assertFalse(scanner.is_preferred_address(address, "Bucheggstrasse 4-12"), address)
+
+    def test_preferred_rooms_rank_first_without_bypassing_filters(self):
+        options = scanner.parse_args([])
+        listings = [dict(ROOM, pk=1, rent_gross=500, public_address="Other street 1"),
+                    dict(ROOM, pk=2, rent_gross=800, public_address="Bucheggstrasse 10"),
+                    dict(ROOM, pk=3, rent_gross=801, public_address="Bucheggstrasse 6"),
+                    dict(ROOM, pk=4, rent_gross=600, public_address="Bucheggstrasse 8", longitude=8.8)]
+        matches, _ = scanner.filter_listings(listings, options, *CENTER[:2])
+        self.assertEqual([m["id"] for m in matches], ["flatfox:2", "flatfox:1"])
+        self.assertTrue(matches[0]["preferred_address_match"])
+        options.preferred_address = ""
+        matches, _ = scanner.filter_listings(listings, options, *CENTER[:2])
+        self.assertEqual([m["id"] for m in matches], ["flatfox:1", "flatfox:2"])
+
+    def test_preference_orders_combined_sources_and_is_exported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            options = scanner.parse_args(["--output-dir", directory])
+            preferred = dict(ROOM, source="wgzimmer", pk="preferred", rent_gross=None,
+                             advertised_monthly_rent=800, public_address="Bucheggstrasse 10",
+                             url="https://www.wgzimmer.ch/wglink/en/preferred")
+            stats = {"candidate_count": 1, "details_count": 1, "unavailable_details_count": 0,
+                     "unknown_location_count": 0}
+            with patch.object(scanner, "fetch_pins", return_value=[{"pk": 123}]), \
+                    patch.object(scanner, "fetch_details", return_value=[dict(ROOM, rent_gross=500)]), \
+                    patch.object(scanner, "fetch_wgzimmer", return_value=([preferred], stats)), \
+                    patch("sys.stdout", new_callable=io.StringIO) as output:
+                report = scanner.scan(options, CENTER)
+            self.assertTrue(report["complete"])
+            self.assertEqual(report["matches"][0]["source"], "wgzimmer.ch")
+            self.assertEqual(report["filters"]["preferred_address"], "Bucheggstrasse 4-12")
+            self.assertIn("[PREFERRED]", output.getvalue())
+            self.assertIn("preferred_address_match", (Path(directory) / "results.csv").read_text())
 
     def test_distance_and_bounding_box_enclose_cardinal_points(self):
         self.assertEqual(scanner.distance_km(47, 8, 47, 8), 0)
@@ -132,12 +184,22 @@ class ScannerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(json.dumps({"max_price": 900, "radius_km": 8}), encoding="utf-8")
-            options = self.options("--config", str(path), "--max-price", "1000")
+            options = scanner.parse_args(["--config", str(path), "--max-price", "1000"])
             self.assertEqual((options.max_price, options.radius_km), (1000, 8))
         for args in (("--max-price", "nan"), ("--radius-km", "0"), ("--interval", "0"),
                      ("--min-distance-km", "6"), ("--max-price", "-1")):
             with self.subTest(args=args), patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
                 self.options(*args)
+
+    def test_preference_config_and_cli_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"preferred_address": "Other street 1-5"}), encoding="utf-8")
+            self.assertEqual(scanner.parse_args(["--config", str(path)]).preferred_address, "Other street 1-5")
+            self.assertEqual(scanner.parse_args(["--config", str(path), "--preferred-address", ""]).preferred_address, "")
+        for preference in ("Bucheggstrasse 12-4", "123"):
+            with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+                scanner.parse_args(["--preferred-address", preference])
 
     def test_access_denied_is_not_retried(self):
         error = HTTPError("https://flatfox.ch/", 403, "Forbidden", {}, None)
@@ -151,14 +213,14 @@ class ScannerTests(unittest.TestCase):
             result = Path(directory) / "results.json"
             result.write_text("previous results", encoding="utf-8")
             with patch.object(scanner, "fetch_pins", side_effect=scanner.ScannerError("offline")):
-                self.assertEqual(scanner.main(["scan", "--sources", "flatfox", "--output-dir", directory]), 1)
+                self.assertEqual(scanner.main(["scan", "--center", "Zürich HB", "--sources", "flatfox", "--output-dir", directory]), 1)
             self.assertEqual(result.read_text(), "previous results")
 
     def test_watch_runs_again_after_failure_and_handles_ctrl_c(self):
         with patch.object(scanner, "scan", side_effect=[scanner.ScannerError("offline"), {}]) as scan:
             with patch.object(scanner.time, "sleep", side_effect=[None, KeyboardInterrupt]) as sleep:
                 with patch("sys.stdout", new_callable=io.StringIO):
-                    self.assertEqual(scanner.main(["watch", "--interval", "15"]), 0)
+                    self.assertEqual(scanner.main(["watch", "--center", "Zürich HB", "--interval", "15"]), 0)
             self.assertEqual(scan.call_count, 2)
             self.assertEqual(sleep.call_args_list[0].args, (900,))
 

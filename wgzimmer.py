@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 BASE = "https://www.wgzimmer.ch"
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
+# Preserve existing configs while using the current city/canton identifiers.
+REGION_ALIASES = {"zurich-stadt": "zuerich", "zurich": "kanton-zuerich"}
 
 
 class WGZimmerError(Exception):
@@ -70,7 +72,7 @@ def safe_url(value):
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.netloc not in ("wgzimmer.ch", "www.wgzimmer.ch"):
         raise WGZimmerError("Unexpected wgzimmer link or pagination host.")
-    if not parsed.path.startswith(("/en/wgzimmer/", "/wgzimmer/", "/wglink/")):
+    if not parsed.path.startswith(("/en/wgzimmer/", "/wgzimmer/", "/wglink/", "/en/wg-zimmer/", "/wg-zimmer/")):
         raise WGZimmerError("Unexpected wgzimmer link path.")
     return urlunparse(parsed._replace(netloc="www.wgzimmer.ch", fragment=""))
 
@@ -78,12 +80,34 @@ def safe_url(value):
 def parse_search(content):
     root = Document(content).root
     text = root.text()
-    total = re.search(r"\bTotal\s*:?\s*(\d+)\b", text, re.I)
-    if total is None:
+    result_list = next((node for node in root.nodes("ol")
+                        if "result-list" in node.attrs.get("class", "").split()), None)
+    count_node = next((node for node in root.nodes()
+                       if "search__count" in node.attrs.get("class", "").split()), None)
+    if result_list is not None and result_list.attrs.get("data-total", "").isdigit():
+        count = int(result_list.attrs["data-total"])
+    elif count_node is not None and re.fullmatch(r"[\d\s'’]+ ads?", count_node.text()):
+        count = int(re.sub(r"\D", "", count_node.text()))
+    else:
+        total = re.search(r"\bTotal\s*:?\s*(\d+)\b", text, re.I)
+        count = int(total[1]) if total else None
+    if count is None:
         raise WGZimmerError("wgzimmer did not return search results (search form, CAPTCHA, or changed HTML).")
     entries = []
     for row in root.nodes("li"):
-        if "search-mate-entry" not in row.attrs.get("class", "").split():
+        classes = row.attrs.get("class", "").split()
+        if "result-row" in classes:
+            identifier = UUID.fullmatch(row.attrs.get("data-ad-id", ""))
+            anchor = next((a for a in row.nodes("a")
+                           if "result-row__link" in a.attrs.get("class", "").split()), None)
+            if identifier is None or anchor is None:
+                raise WGZimmerError("wgzimmer room entry is missing its ID or link.")
+            url = safe_url(anchor.attrs.get("href", ""))
+            if not urlparse(url).path.startswith(("/en/wg-zimmer/", "/wg-zimmer/")):
+                raise WGZimmerError("wgzimmer returned a non-room search result.")
+            entries.append({"pk": identifier.group().lower(), "url": url})
+            continue
+        if "search-mate-entry" not in classes:
             continue
         for anchor in row.nodes("a"):
             href = anchor.attrs.get("href", "")
@@ -91,12 +115,14 @@ def parse_search(content):
             if identifier and ("/wglink/" in href or "/wgzimmer/" in href):
                 entries.append({"pk": identifier.group().lower(), "url": safe_url(href)})
                 break
-    count = int(total.group(1))
     if (count > 0 and not entries) or (count == 0 and entries):
         raise WGZimmerError("wgzimmer result count and room entries disagree; its HTML may have changed.")
-    next_url = None
+    next_url = safe_url(result_list.attrs["data-next-page"]) if (
+        result_list is not None and result_list.attrs.get("data-next-page")) else None
     for anchor in root.nodes("a"):
-        if "next" in anchor.attrs.get("class", "").split() or anchor.text().strip().casefold() in ("next", "next >", "weiter"):
+        if ("next" in anchor.attrs.get("rel", "").split() or
+                "next" in anchor.attrs.get("class", "").split() or
+                anchor.text().strip().casefold() in ("next", "next >", "next ›", "weiter")):
             if anchor.attrs.get("href"):
                 next_url = safe_url(anchor.attrs["href"])
                 break
@@ -106,6 +132,29 @@ def parse_search(content):
     return entries, next_url, count
 
 
+def validate_search_filters(content, region, max_price, furnished):
+    """Do not silently accept an unfiltered page when the site ignores a query."""
+    root = Document(content).root
+    form = next((n for n in root.nodes("form")
+                 if "search-filter__form" in n.attrs.get("class", "").split()), None)
+    if form is None:
+        if any("search__count" in n.attrs.get("class", "").split() or
+               "result-list" in n.attrs.get("class", "").split() for n in root.nodes()):
+            raise WGZimmerError("wgzimmer search filter form is missing; cannot verify query filters.")
+        # Legacy HTML has no current filter form; parse_search checks its structure.
+        return
+    selected = {}
+    for node in form.nodes("select"):
+        choice = next((o for o in node.nodes("option") if "selected" in o.attrs), None)
+        selected[node.attrs.get("name")] = choice.attrs.get("value", "") if choice else ""
+    inputs = {n.attrs.get("name"): n for n in form.nodes("input")}
+    if (selected.get("region") != region or "max" not in inputs or
+            inputs["max"].attrs.get("value") != str(max_price) or
+            (furnished and ("moebliert" not in inputs or "checked" not in inputs["moebliert"].attrs))):
+        raise WGZimmerError("wgzimmer did not apply the requested region, rent, or furnished filters. "
+                            "Check --wgzimmer-regions; its search form may have changed.")
+
+
 def label_key(value):
     value = unicodedata.normalize("NFKD", value.casefold())
     return " ".join(re.sub(r"[^a-z0-9]+", "", "".join(c for c in value if not unicodedata.combining(c))).split())
@@ -113,6 +162,13 @@ def label_key(value):
 
 def labeled_values(root):
     fields = {}
+    for label in root.nodes("dt"):
+        siblings = label.parent.children
+        for sibling in siblings[siblings.index(label) + 1:]:
+            if isinstance(sibling, Node):
+                if sibling.tag == "dd":
+                    fields[label_key(label.text())] = sibling.text()
+                break
     for label in root.nodes("strong"):
         if label.parent is None:
             continue
@@ -157,6 +213,9 @@ def coordinates(root):
         meta[key] = node.attrs.get("content")
     pairs = [(meta.get("latitude") or meta.get("place:location:latitude"),
               meta.get("longitude") or meta.get("place:location:longitude"))]
+    for node in root.nodes():
+        if "ad-map" in node.attrs.get("class", "").split():
+            pairs.append((node.attrs.get("data-lat"), node.attrs.get("data-lon")))
     for anchor in root.nodes("a"):
         parsed = urlparse(anchor.attrs.get("href", ""))
         if parsed.hostname and (parsed.hostname == "maps.google.com" or parsed.hostname.startswith("www.google.")):
@@ -184,8 +243,16 @@ def parse_detail(content, entry):
         return next((fields[label_key(name)] for name in names if label_key(name) in fields), "")
 
     rent_text = field("Monthly rent", "Miete pro Monat", "Mietzins", "Monatliche Miete")
+    rent_node = next((n for n in root.nodes()
+                      if "ad-page__rent-value" in n.attrs.get("class", "").split()), None)
+    if rent_node is not None:
+        rent_text = rent_node.text()
     city = field("City", "Ort", "Stadt")
     street = field("Address", "Adresse")
+    if not city and street:
+        address = re.fullmatch(r"(.*?)\s*(\d{4}\s+.+)", street)
+        if address:
+            street, city = address[1].strip(), address[2].strip()
     if not rent_text and not city and not street:
         text = root.text().casefold()
         if any(message in text for message in ("no longer available", "no longer exists", "nicht mehr vorhanden", "nicht mehr verfügbar")):
@@ -196,21 +263,25 @@ def parse_detail(content, entry):
         if node.attrs.get("property") == "og:title":
             title = node.attrs.get("content")
             break
-    start = field("Starting from", "Ab dem", "Ab")
+    start = field("Starting from", "From", "Ab dem", "Ab")
     until = field("Until", "Bis")
-    permanent = any(word in until.casefold() for word in ("no time restrictions", "unbefristet", "unbeschränkt"))
+    permanent = any(word in until.casefold() for word in ("no time restrictions", "open-ended", "unlimited", "unbefristet", "unbeschränkt"))
     furnished_text = field("Furnished", "Möbliert")
     furnished = {"yes": True, "ja": True, "no": False, "nein": False}.get(furnished_text.casefold())
     point = coordinates(root)
+    approximate = any("ad-map" in n.attrs.get("class", "").split() and "data-approximate" in n.attrs
+                      for n in root.nodes())
+    flat_type = field("Type of flat share")
     return {
         "pk": entry["pk"], "source": "wgzimmer", "url": entry["url"],
-        "object_category": "SHARED", "offer_type": "RENT", "status": "act", "country": "CH",
+        "object_category": "APARTMENT" if flat_type.casefold() == "studio" else "SHARED",
+        "offer_type": "RENT", "status": "act", "country": "CH",
         "price_unit": "monthly", "advertised_monthly_rent": money(rent_text),
         "description_title": title or "WG room in {}".format(city or "Zürich"),
         "public_address": ", ".join(part for part in (street, city) if part),
         "street": street, "city": city,
         "latitude": point[0] if point else None, "longitude": point[1] if point else None,
-        "location_accuracy": "advertised" if point else None,
+        "location_accuracy": ("advertised_approximate" if approximate else "advertised") if point else None,
         "moving_date": iso_date(start), "moving_date_type": start or None,
         "is_temporary": False if permanent else (True if iso_date(until) else None),
         "is_furnished": furnished,
@@ -260,17 +331,22 @@ def geocode_address(client, listing, cache):
 def fetch_wgzimmer(client, options, cache):
     entries = {}
     for region in options.wgzimmer_regions:
-        url = BASE + "/en/wgzimmer/search/mate.html?" + urlencode({
-            "startSearch": "true", "priceMin": 0, "priceMax": math.ceil(options.max_price),
-            "wgState": region, "permanent": "all", "student": "none", "typeofwg": "all",
-            "wc_language": "en",
-        })
+        region = REGION_ALIASES.get(region, region)
+        max_price = math.ceil(options.max_price)
+        params = {"region": region, "min": 0, "max": max_price}
+        if options.furnished:
+            params["moebliert"] = "ja"
+        url = BASE + "/en/wgzimmer/search/mate.html?" + urlencode(params)
         visited, region_ids, total = set(), set(), 0
         while url:
             if url in visited or len(visited) >= 100:
                 raise WGZimmerError("wgzimmer pagination repeated or exceeded 100 pages.")
             visited.add(url)
-            page, next_url, count = parse_search(client.get_text(url))
+            if urlparse(url).path != "/en/wgzimmer/search/mate.html":
+                raise WGZimmerError("Unexpected wgzimmer search pagination path.")
+            content = client.get_text(url)
+            validate_search_filters(content, region, max_price, options.furnished)
+            page, next_url, count = parse_search(content)
             total = max(total, count)
             for entry in page:
                 entries[entry["pk"]] = entry
@@ -286,7 +362,8 @@ def fetch_wgzimmer(client, options, cache):
             removed += 1
             continue
         # Avoid geocoding rooms already excluded by their rent or furnished status.
-        if listing["advertised_monthly_rent"] is not None and listing["advertised_monthly_rent"] <= options.max_price and (
+        if (listing["object_category"] == "SHARED" and listing["advertised_monthly_rent"] is not None
+                and listing["advertised_monthly_rent"] <= options.max_price) and (
                 not options.furnished or listing["is_furnished"] is True):
             if listing["latitude"] is None:
                 point = geocode_address(client, listing, cache)

@@ -24,6 +24,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from wgzimmer import WGZimmerError, fetch_wgzimmer
+from notifications import NotificationError, notify_rooms, settings_from_env
 
 
 LOG = logging.getLogger("room_scanner")
@@ -31,9 +32,10 @@ FLATFOX = "https://flatfox.ch"
 PIN_LIMIT = 1000
 EARTH_KM = 6371.0088
 DEFAULTS = {
-    "max_price": 1200.0,
-    "center": "Zürich HB",
-    "radius_km": 5.0,
+    "max_price": 800.0,
+    "center": "Bucheggstrasse 10, Zürich",
+    "radius_km": 1.0,
+    "preferred_address": "Bucheggstrasse 4-12",
     "min_distance_km": 0.0,
     "interval_minutes": 30.0,
     "furnished": False,
@@ -241,6 +243,33 @@ def monthly_rent(listing):
     return None
 
 
+def address_preference(value):
+    """Parse a street with an optional house number or inclusive number range."""
+    match = re.fullmatch(r"(.+?)(?:\s+(\d+)(?:\s*[-–—]\s*(\d+))?)?", normalized(value))
+    street, first, last = match.groups()
+    return street, int(first) if first else None, int(last or first) if first else None
+
+
+def is_preferred_address(address, preference):
+    if not preference:
+        return False
+    street, first, last = address_preference(preference)
+    if first is None:
+        return re.match(re.escape(street) + r"(?=\s|,|$)", normalized(address)) is not None
+    match = re.match(re.escape(street) + r"\s+(\d+)(?:\s*[-–—]\s*(\d+))?(?=\s|,|$)",
+                     normalized(address))
+    if not match:
+        return False
+    start, end = int(match[1]), int(match[2] or match[1])
+    return first is None or first <= start <= end <= last
+
+
+def result_sort_key(item, options):
+    if options.preferred_address:
+        return (not item["preferred_address_match"], item["distance_km"], item["price_chf"], item["id"])
+    return (item["price_chf"], item["distance_km"], item["id"])
+
+
 def filter_listings(listings, options, lat, lon):
     matches = []
     unknown_price = 0
@@ -268,12 +297,14 @@ def filter_listings(listings, options, lat, lon):
         listing_url = urljoin(base, listing.get("url") or "/{}/".format(listing["pk"]))
         if urlparse(listing_url).scheme != "https" or urlparse(listing_url).netloc != urlparse(base).netloc:
             raise ScannerError("Unexpected listing link from {}.".format(label))
+        address = listing.get("public_address") or listing.get("street") or listing.get("city") or ""
         matches.append({
             "id": "{}:{}".format(source, listing["pk"]), "source": label,
             "title": listing.get("description_title") or listing.get("short_title") or "WG room",
             "price_chf": price, "distance_km": round(distance, 3),
             "price_basis": "advertised_monthly" if source == "wgzimmer" else "gross_monthly",
-            "address": listing.get("public_address") or listing.get("city") or "",
+            "address": address,
+            "preferred_address_match": is_preferred_address(address, options.preferred_address),
             "latitude": room_lat, "longitude": room_lon,
             "location_accuracy": listing.get("location_accuracy") or "advertised",
             "available_from": listing.get("moving_date"),
@@ -281,7 +312,7 @@ def filter_listings(listings, options, lat, lon):
             "furnished": listing.get("is_furnished"), "temporary": listing.get("is_temporary"),
             "published": listing.get("published"), "url": listing_url,
         })
-    matches.sort(key=lambda item: (item["price_chf"], item["distance_km"], item["id"]))
+    matches.sort(key=lambda item: result_sort_key(item, options))
     return matches, unknown_price
 
 
@@ -324,12 +355,13 @@ def save_results(options, center, matches, metadata):
             match["first_seen"] = seen.get(match["id"], metadata["scanned_at"])
         report = dict(metadata, source=", ".join(options.sources), center={"latitude": center[0], "longitude": center[1],
                       "label": center[2]}, filters=dict(criteria, sources=options.sources,
-                      wgzimmer_regions=options.wgzimmer_regions), new_count=sum(item["is_new"] for item in matches),
+                      wgzimmer_regions=options.wgzimmer_regions, preferred_address=options.preferred_address),
+                      new_count=sum(item["is_new"] for item in matches),
                       matches=matches)
         atomic_write(output / "results.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         fields = ["id", "title", "price_chf", "distance_km", "address", "url", "available_from",
                   "availability_type", "furnished", "temporary", "published", "latitude", "longitude",
-                  "source", "price_basis", "location_accuracy", "is_new", "first_seen"]
+                  "source", "price_basis", "location_accuracy", "preferred_address_match", "is_new", "first_seen"]
         buffer = io.StringIO(newline="")
         writer = csv.DictWriter(buffer, fieldnames=fields)
         writer.writeheader()
@@ -347,6 +379,7 @@ def save_results(options, center, matches, metadata):
 
 
 def scan(options, center):
+    ntfy = settings_from_env()
     matches, sources = [], {}
     for source in options.sources:
         try:
@@ -387,19 +420,25 @@ def scan(options, center):
             LOG.error("%s failed: %s", source, exc)
     if not any(status["ok"] for status in sources.values()):
         raise ScannerError("All requested sources failed. Previous result files were preserved.")
-    matches.sort(key=lambda item: (item["price_chf"], item["distance_km"], item["id"]))
+    matches.sort(key=lambda item: result_sort_key(item, options))
     complete = all(status["complete"] for status in sources.values())
     report = save_results(options, center, matches, {
         "scanned_at": datetime.now(timezone.utc).isoformat(), "complete": complete, "sources": sources,
         **{key: sum(status.get(key, 0) for status in sources.values()) for key in (
             "candidate_count", "details_count", "unavailable_details_count", "unknown_monthly_rent_count", "unknown_location_count")},
     })
+    bucheggstrasse_rooms = [room for room in matches if is_preferred_address(room["address"], "Bucheggstrasse")]
+    report["notifications"] = notify_rooms(ntfy, bucheggstrasse_rooms, options.output_dir)
+    atomic_write(options.output_dir / "results.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print("\n{}{} rooms match | {} new | max CHF {:g} | {:.1f} km around {}".format(
         "[PARTIAL] " if not complete else "", len(matches), report["new_count"], options.max_price, options.radius_km, center[2]))
     visible = [item for item in matches if item["is_new"] or not options.new_only]
+    if options.preferred_address:
+        print("Preferred address: {} (listed first; nearby rooms are backups)".format(options.preferred_address))
     for item in visible:
-        print("{}[{}] CHF {:g}/month | {:.2f} km | {}".format(
-            "[NEW] " if item["is_new"] else "", item["source"], item["price_chf"], item["distance_km"], item["title"]))
+        print("{}{}[{}] CHF {:g}/month | {:.2f} km | {}".format(
+            "[NEW] " if item["is_new"] else "", "[PREFERRED] " if item["preferred_address_match"] else "",
+            item["source"], item["price_chf"], item["distance_km"], item["title"]))
         print("  {}\n  {}".format(item["address"], item["url"]))
     print("Saved {} and {}\n".format(options.output_dir / "results.json", options.output_dir / "results.csv"), flush=True)
     return report
@@ -409,10 +448,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Find WG rooms on Flatfox and wgzimmer.ch by monthly rent and straight-line distance.")
     parser.add_argument("command", nargs="?", choices=("scan", "watch"), default="scan")
     parser.add_argument("--config", type=Path, help="JSON configuration file; CLI values override it")
-    parser.add_argument("--max-price", type=float, help="Maximum monthly rent in CHF (Flatfox gross; wgzimmer advertised; default: 1200)")
-    parser.add_argument("--center", help='Swiss address/place or "latitude,longitude" (default: Zürich HB)')
+    parser.add_argument("--max-price", type=float, help="Maximum monthly rent in CHF (Flatfox gross; wgzimmer advertised; default: 800)")
+    parser.add_argument("--center", help='Swiss address/place or "latitude,longitude" (default: Bucheggstrasse 10, Zürich)')
+    parser.add_argument("--preferred-address", help='Street with optional house number/range to list first '
+                        '(default: Bucheggstrasse 4-12; pass "" to disable)')
     parser.add_argument("--radius-km", "--radius", "--max-distance-km", dest="radius_km", type=float,
-                        help="Maximum straight-line distance in km (default: 5)")
+                        help="Maximum straight-line distance in km (default: 1)")
     parser.add_argument("--min-distance-km", type=float, help="Optional inner radius in km (default: 0)")
     parser.add_argument("--interval-minutes", "--interval", dest="interval_minutes", type=float,
                         help="In watch mode: minutes between scans, at least 5 (default: 30)")
@@ -464,6 +505,13 @@ def parse_args(argv=None):
         parser.error("--sources supports only flatfox and wgzimmer")
     if not isinstance(options.center, str) or not options.center.strip():
         parser.error("center must be a nonempty address, place, or lat,lon string")
+    if not isinstance(options.preferred_address, str):
+        parser.error("preferred_address must be a string (empty disables preference)")
+    options.preferred_address = options.preferred_address.strip()
+    if options.preferred_address:
+        street, first, last = address_preference(options.preferred_address)
+        if not re.search(r"[^\W\d_]", street) or (first is not None and first > last):
+            parser.error("preferred_address must be a street with an optional house number or ascending range")
     try:
         options.output_dir = Path(options.output_dir if options.output_dir is not None else "data").resolve()
     except (TypeError, ValueError, OSError) as exc:
@@ -481,8 +529,10 @@ def main(argv=None):
             try:
                 report = scan(options, center)
                 if options.command == "scan":
+                    if report.get("notifications", {}).get("failed_count", 0):
+                        return 3
                     return 0 if report["complete"] else 2
-            except (ScannerError, OSError, sqlite3.Error) as exc:
+            except (ScannerError, NotificationError, OSError, sqlite3.Error) as exc:
                 LOG.error("Scan failed: %s", exc)
                 if options.command == "scan":
                     return 1

@@ -209,6 +209,32 @@ class WGZimmerTests(unittest.TestCase):
         self.assertEqual(stats["unknown_location_count"], 1)
         self.assertEqual(scanner.filter_listings(listings, options, *CENTER[:2])[0], [])
 
+    def test_long_address_does_not_abort_source_or_discard_other_rooms(self):
+        directions = "In der Nähe von der Bushaltestelle Wädenswil, Schluchtal"
+        detail = DETAIL.replace("Langstrasse 120", directions).replace(
+            "8004 Zürich", "8824 Schönenberg ZH").replace(
+            "q=47.378178,8.540218", "q=Schluchtal")
+        search = SEARCH.replace("Total 1", "Total 2").replace(
+            "</ul>", '<li class="search-mate-entry"><a href="/wglink/en/{}">Room</a></li></ul>'.format(ID2))
+        client = Client([search, detail, DETAIL])
+        options = self.options(["--wgzimmer-regions", "zurich-stadt"])
+        listings, stats = wg.fetch_wgzimmer(client, options, {})
+        self.assertEqual(client.geo_calls, 0)
+        self.assertEqual(stats["unknown_location_count"], 1)
+        self.assertEqual(stats["details_count"], 2)
+        matches, _ = scanner.filter_listings(listings, options, *CENTER[:2])
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["id"], "wgzimmer:" + ID2)
+
+    def test_geocoding_accepts_ten_words_but_skips_eleven(self):
+        listing = wg.parse_detail(DETAIL, ENTRY)
+        client = Client(geo={"results": []})
+        address = "one two three four five six seven eight nine ten"
+        self.assertIsNone(wg.geocode_address(client, dict(listing, public_address=address), {}))
+        self.assertEqual(client.geo_calls, 1)
+        self.assertIsNone(wg.geocode_address(client, dict(listing, public_address=address + " eleven"), {}))
+        self.assertEqual(client.geo_calls, 1)
+
     def test_tls_errors_fail_immediately_without_disabling_verification(self):
         error = URLError(ssl.SSLCertVerificationError(1, "certificate has expired"))
         with patch.object(scanner, "urlopen", side_effect=error) as request:

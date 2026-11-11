@@ -308,6 +308,11 @@ def geocode_address(client, listing, cache):
                 all(isinstance(v, (float, int)) and not isinstance(v, bool) and math.isfinite(v) for v in point)
                 and 45 <= point[0] <= 48.5 and 5 <= point[1] <= 11):
             return tuple(point)
+    # GeoAdmin rejects searchText longer than ten words with HTTP 400.
+    # Listings sometimes give directions instead of an address. Do not truncate
+    # those into a different location or let one discard the entire source.
+    if len(address.split()) > 10:
+        return None
     response = client.get_json("https://api3.geo.admin.ch/rest/services/ech/SearchServer?" + urlencode({
         "searchText": address, "type": "locations", "origins": "address", "sr": 4326, "limit": 5,
     }))

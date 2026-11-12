@@ -23,7 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
-from wgzimmer import WGZimmerError, fetch_wgzimmer
+from wgzimmer import WGZimmerError, TransientRequestError, fetch_wgzimmer
 from notifications import NotificationError, notify_rooms, settings_from_env
 
 
@@ -46,6 +46,10 @@ DEFAULTS = {
 
 class ScannerError(Exception):
     """A user-facing configuration, network, or source error."""
+
+
+class NetworkError(ScannerError, TransientRequestError):
+    """Transient transport failure after retries; safe to isolate per page."""
 
 
 class HttpClient:
@@ -101,7 +105,7 @@ class HttpClient:
                     raise ScannerError("TLS certificate validation failed for {}: {}. Certificate verification remains enabled."
                                        .format(urlparse(url).hostname, exc)) from exc
                 if attempt == 2:
-                    raise ScannerError("Cannot reach {}: {}".format(urlparse(url).hostname, exc)) from exc
+                    raise NetworkError("Cannot reach {}: {}".format(urlparse(url).hostname, exc)) from exc
                 time.sleep(2 ** (attempt + 1))
             except (ValueError, UnicodeError) as exc:
                 raise ScannerError("Invalid text from {}; the source may have changed."
@@ -413,7 +417,9 @@ def scan(options, center):
             matches.extend(source_matches)
             sources[source] = dict(stats, ok=True, match_count=len(source_matches),
                                    unknown_monthly_rent_count=unknown_price,
-                                   complete=stats["unavailable_details_count"] == 0 and stats["unknown_location_count"] == 0)
+                                   complete=(stats["unavailable_details_count"] == 0
+                                             and stats["unknown_location_count"] == 0
+                                             and not stats.get("search_errors")))
             LOG.info("%s: %s matches; %s without known monthly rent; %s without usable locations", source,
                      len(source_matches), unknown_price, stats["unknown_location_count"])
         except (ScannerError, WGZimmerError, OSError) as exc:

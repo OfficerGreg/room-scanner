@@ -108,8 +108,15 @@ jobs:
                   summary.write(f"Scanned at {html.escape(report['scanned_at'])} (UTC).\n\n")
                   for source, source_status in report["sources"].items():
                       details = source_status.get("error") or (
-                          "complete" if source_status["complete"] else "incomplete; see results.json")
+                          "complete" if source_status["complete"] else
+                          f"partial: {source_status.get('match_count', 0)} matches retained; "
+                          f"{len(source_status.get('search_errors', []))} search pages failed; "
+                          f"{source_status.get('unavailable_details_count', 0)} details unavailable; "
+                          f"{source_status.get('unknown_location_count', 0)} locations unresolved")
                       summary.write(f"<p>{html.escape(source)}: {html.escape(details)}</p>\n")
+                      for failure in source_status.get("search_errors", []) + source_status.get("failed_details", []):
+                          summary.write(f"<p>{html.escape(failure['url'] or failure.get('region', 'search'))}: "
+                                        f"{html.escape(failure['error'])}</p>\n")
                   notifications = report.get("notifications", {})
                   if notifications.get("enabled"):
                       summary.write(f"\nntfy: {notifications['sent_count']} sent; {notifications['failed_count']} awaiting delivery.\n\n")

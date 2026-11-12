@@ -263,6 +263,56 @@ class WGZimmerTests(unittest.TestCase):
         self.assertIsNone(wg.geocode_address(client, dict(listing, public_address=address + " eleven"), {}))
         self.assertEqual(client.geo_calls, 1)
 
+    def test_timeout_retries_then_raises_recoverable_network_error(self):
+        with patch.object(scanner, "urlopen", side_effect=URLError(TimeoutError("timed out"))) as request, \
+                patch.object(scanner.time, "sleep"):
+            with self.assertRaises(wg.TransientRequestError):
+                scanner.HttpClient(delay=0).get_text(wg.BASE)
+        self.assertEqual(request.call_count, 3)
+
+    def test_detail_timeout_preserves_other_rooms_and_reports_failed_url(self):
+        search = SEARCH.replace("Total 1", "Total 2").replace(
+            "</ul>", '<li class="search-mate-entry"><a href="/wglink/en/{}">Room</a></li></ul>'.format(ID2))
+        client = Client()
+        client.get_text = unittest.mock.Mock(side_effect=[search, scanner.NetworkError("timed out"), DETAIL])
+        options = self.options(["--wgzimmer-regions", "zurich-stadt"])
+        listings, stats = wg.fetch_wgzimmer(client, options, {})
+        self.assertEqual([listing["pk"] for listing in listings], [ID2])
+        self.assertEqual(stats["unavailable_details_count"], 1)
+        self.assertEqual(stats["failed_details"][0]["url"], ENTRY["url"])
+        self.assertEqual(stats["failed_details"][0]["error"], "timed out")
+
+    def test_search_timeout_preserves_entries_and_scans_other_region(self):
+        first = SEARCH + '<a class="next" href="/en/wgzimmer/search/mate.html?page=2">Next</a>'
+        client = Client()
+        client.get_text = unittest.mock.Mock(side_effect=[first, scanner.NetworkError("timed out"), SEARCH, DETAIL])
+        listings, stats = wg.fetch_wgzimmer(client, self.options([]), {})
+        self.assertEqual(len(listings), 1)
+        self.assertEqual(stats["search_errors"][0]["region"], "zuerich")
+        self.assertIn("page=2", stats["search_errors"][0]["url"])
+        self.assertEqual(client.get_text.call_count, 4)
+
+    def test_geocoder_timeout_preserves_other_rooms(self):
+        detail = DETAIL.replace("q=47.378178,8.540218", "q=Langstrasse")
+        client = Client([SEARCH, detail])
+        client.get_json = unittest.mock.Mock(side_effect=scanner.NetworkError("geocoder timed out"))
+        listings, stats = wg.fetch_wgzimmer(client, self.options(["--wgzimmer-regions", "zurich-stadt"]), {})
+        self.assertEqual(len(listings), 1)
+        self.assertEqual(stats["unknown_location_count"], 1)
+        self.assertEqual(stats["unknown_locations"][0]["reason"], "geocoder timed out")
+
+    def test_outage_stops_detail_requests_after_three_consecutive_failures(self):
+        rows = ''.join('<li class="search-mate-entry"><a href="/wglink/en/{}">Room</a></li>'.format(
+            "{:08d}-2222-3333-4444-555555555555".format(i)) for i in range(5))
+        client = Client()
+        client.get_text = unittest.mock.Mock(side_effect=["<span>Total 5</span><ul>" + rows + "</ul>"] +
+                                            [scanner.NetworkError("timed out")] * 3)
+        listings, stats = wg.fetch_wgzimmer(client, self.options(["--wgzimmer-regions", "zurich-stadt"]), {})
+        self.assertEqual(listings, [])
+        self.assertEqual(client.get_text.call_count, 4)
+        self.assertEqual(stats["unavailable_details_count"], 5)
+        self.assertEqual(len(stats["failed_details"]), 5)
+
     def test_tls_errors_fail_immediately_without_disabling_verification(self):
         error = URLError(ssl.SSLCertVerificationError(1, "certificate has expired"))
         with patch.object(scanner, "urlopen", side_effect=error) as request:
@@ -291,6 +341,22 @@ class WGZimmerTests(unittest.TestCase):
             self.assertFalse(report["sources"]["wgzimmer"]["ok"])
             self.assertEqual(report["sources"]["wgzimmer"]["error"], "challenge")
             self.assertTrue((Path(directory) / "results.json").exists())
+
+    def test_failed_search_page_keeps_matches_and_marks_scan_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            options = self.options(["--sources", "wgzimmer", "--output-dir", directory])
+            listings = [wg.parse_detail(DETAIL, ENTRY)]
+            stats = {"candidate_count": 1, "details_count": 1, "unavailable_details_count": 0,
+                     "unknown_location_count": 0,
+                     "search_errors": [{"url": wg.BASE, "region": "zuerich", "error": "timed out"}]}
+            with patch.object(scanner, "fetch_wgzimmer", return_value=(listings, stats)), \
+                    patch("sys.stdout", new_callable=io.StringIO):
+                report = scanner.scan(options, CENTER)
+            self.assertFalse(report["complete"])
+            self.assertTrue(report["sources"]["wgzimmer"]["ok"])
+            self.assertFalse(report["sources"]["wgzimmer"]["complete"])
+            self.assertEqual(len(report["matches"]), 1)
+            self.assertEqual(report["sources"]["wgzimmer"]["search_errors"], stats["search_errors"])
 
     def test_wgzimmer_works_when_flatfox_fails(self):
         with tempfile.TemporaryDirectory() as directory:

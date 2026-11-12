@@ -18,6 +18,10 @@ class WGZimmerError(Exception):
     pass
 
 
+class TransientRequestError(Exception):
+    """A request still failed after transient-network retries."""
+
+
 class Node:
     def __init__(self, tag, attrs=(), parent=None):
         self.tag, self.attrs, self.parent = tag, dict(attrs), parent
@@ -367,7 +371,7 @@ def postcode_outside_search(client, listing, bounds):
 
 
 def fetch_wgzimmer(client, options, cache, search_bounds=None):
-    entries = {}
+    entries, search_errors = {}, []
     for region in options.wgzimmer_regions:
         region = REGION_ALIASES.get(region, region)
         max_price = math.ceil(options.max_price)
@@ -376,27 +380,40 @@ def fetch_wgzimmer(client, options, cache, search_bounds=None):
             params["moebliert"] = "ja"
         url = BASE + "/en/wgzimmer/search/mate.html?" + urlencode(params)
         visited, region_ids, total = set(), set(), 0
-        while url:
-            if url in visited or len(visited) >= 100:
-                raise WGZimmerError("wgzimmer pagination repeated or exceeded 100 pages.")
-            visited.add(url)
-            if urlparse(url).path != "/en/wgzimmer/search/mate.html":
-                raise WGZimmerError("Unexpected wgzimmer search pagination path.")
-            content = client.get_text(url)
-            validate_search_filters(content, region, max_price, options.furnished)
-            page, next_url, count = parse_search(content)
-            total = max(total, count)
-            for entry in page:
-                entries[entry["pk"]] = entry
-                region_ids.add(entry["pk"])
-            url = next_url
-        if len(region_ids) < total:
-            raise WGZimmerError("wgzimmer returned only {} of {} rooms in {}. Search may be incomplete."
-                                .format(len(region_ids), total, region))
+        try:
+            while url:
+                if url in visited or len(visited) >= 100:
+                    raise WGZimmerError("wgzimmer pagination repeated or exceeded 100 pages.")
+                visited.add(url)
+                if urlparse(url).path != "/en/wgzimmer/search/mate.html":
+                    raise WGZimmerError("Unexpected wgzimmer search pagination path.")
+                content = client.get_text(url)
+                validate_search_filters(content, region, max_price, options.furnished)
+                page, next_url, count = parse_search(content)
+                total = max(total, count)
+                for entry in page:
+                    entries[entry["pk"]] = entry
+                    region_ids.add(entry["pk"])
+                url = next_url
+            if len(region_ids) < total:
+                raise WGZimmerError("wgzimmer returned only {} of {} rooms in {}. Search may be incomplete."
+                                    .format(len(region_ids), total, region))
+        except TransientRequestError as exc:
+            search_errors.append({"region": region, "url": url, "error": str(exc)})
     listings, removed, unknown_locations = [], 0, []
     outside_postcode_count = 0
+    failed_details, consecutive_failures = [], 0
     for entry in entries.values():
-        listing = parse_detail(client.get_text(entry["url"]), entry)
+        if consecutive_failures >= 3:
+            failed_details.append(dict(entry, error="Not attempted after three consecutive network failures"))
+            continue
+        try:
+            listing = parse_detail(client.get_text(entry["url"]), entry)
+        except TransientRequestError as exc:
+            failed_details.append(dict(entry, error=str(exc)))
+            consecutive_failures += 1
+            continue
+        consecutive_failures = 0
         if listing is None:
             removed += 1
             continue
@@ -405,20 +422,27 @@ def fetch_wgzimmer(client, options, cache, search_bounds=None):
                 and listing["advertised_monthly_rent"] <= options.max_price) and (
                 not options.furnished or listing["is_furnished"] is True):
             if listing["latitude"] is None:
-                point = geocode_address(client, listing, cache)
-                if point:
-                    listing["latitude"], listing["longitude"] = point
-                    listing["location_accuracy"] = "geocoded_address"
-                elif postcode_outside_search(client, listing, search_bounds):
-                    outside_postcode_count += 1
-                else:
-                    unknown_locations.append({
-                        "id": "wgzimmer:" + listing["pk"],
-                        "url": listing["url"],
-                        "address": listing["public_address"],
-                        "reason": "No advertised coordinates or verified address geocode",
-                    })
+                try:
+                    point = geocode_address(client, listing, cache)
+                    if point:
+                        listing["latitude"], listing["longitude"] = point
+                        listing["location_accuracy"] = "geocoded_address"
+                    elif postcode_outside_search(client, listing, search_bounds):
+                        outside_postcode_count += 1
+                    else:
+                        unknown_locations.append({
+                            "id": "wgzimmer:" + listing["pk"],
+                            "url": listing["url"],
+                            "address": listing["public_address"],
+                            "reason": "No advertised coordinates or verified address geocode",
+                        })
+                except TransientRequestError as exc:
+                    unknown_locations.append({"id": "wgzimmer:" + listing["pk"],
+                                              "url": listing["url"], "address": listing["public_address"],
+                                              "reason": str(exc)})
         listings.append(listing)
     return listings, {"candidate_count": len(entries), "details_count": len(listings),
-                      "unavailable_details_count": removed, "unknown_location_count": len(unknown_locations),
+                      "unavailable_details_count": removed + len(failed_details),
+                      "failed_details": failed_details, "search_errors": search_errors,
+                      "unknown_location_count": len(unknown_locations),
                       "unknown_locations": unknown_locations, "outside_postcode_count": outside_postcode_count}

@@ -226,6 +226,34 @@ class WGZimmerTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["id"], "wgzimmer:" + ID2)
 
+    def test_distant_postcode_resolves_long_directions_without_inventing_coordinates(self):
+        detail = DETAIL.replace("Langstrasse 120", "In der Nähe von der Bushaltestelle Wädenswil, Schluchtal").replace(
+            "8004 Zürich", "8824 Schönenberg ZH").replace("q=47.378178,8.540218", "q=Schluchtal")
+        response = {"results": [{"attrs": {
+            "origin": "zipcode", "detail": "8824", "label": "<b>8824 - Schönenberg ZH</b>",
+            "geom_st_box2d": "BOX(8.614565 47.171481,8.670764 47.213543)",
+        }}]}
+        client = Client([SEARCH, detail], geo=response)
+        options = self.options(["--wgzimmer-regions", "zurich-stadt"])
+        bounds = scanner.bounding_box(47.396286, 8.528607, 1)
+        listings, stats = wg.fetch_wgzimmer(client, options, {}, search_bounds=bounds)
+        self.assertEqual(stats["unknown_location_count"], 0)
+        self.assertEqual(stats["outside_postcode_count"], 1)
+        self.assertIsNone(listings[0]["latitude"])
+        self.assertEqual(scanner.filter_listings(listings, options, *CENTER[:2])[0], [])
+        # An overlapping postcode must remain unresolved, even if its center is far away.
+        response["results"][0]["attrs"]["geom_st_box2d"] = "BOX(8.5 47.1,8.7 47.5)"
+        listings, stats = wg.fetch_wgzimmer(Client([SEARCH, detail], geo=response), options, {}, search_bounds=bounds)
+        self.assertEqual(stats["unknown_location_count"], 1)
+        self.assertEqual(stats["unknown_locations"][0]["url"], ENTRY["url"])
+        self.assertIn("Schluchtal", stats["unknown_locations"][0]["address"])
+        listing = listings[0]
+        for result in ({"results": []}, {"results": [{"attrs": {}}]},
+                       {"results": [{"attrs": dict(response["results"][0]["attrs"],
+                                                   detail="8004", geom_st_box2d="BOX(8.6 47.1,8.7 47.2)")}]}):
+            with self.subTest(result=result):
+                self.assertFalse(wg.postcode_outside_search(Client(geo=result), listing, bounds))
+
     def test_geocoding_accepts_ten_words_but_skips_eleven(self):
         listing = wg.parse_detail(DETAIL, ENTRY)
         client = Client(geo={"results": []})

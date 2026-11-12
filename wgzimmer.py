@@ -333,7 +333,40 @@ def geocode_address(client, listing, cache):
     return None
 
 
-def fetch_wgzimmer(client, options, cache):
+def postcode_outside_search(client, listing, bounds):
+    """Exclude only when the entire verified postcode lies outside the search box."""
+    postcode = re.match(r"^(\d{4})\s+", listing["city"])
+    if bounds is None or postcode is None:
+        return False
+    response = client.get_json("https://api3.geo.admin.ch/rest/services/ech/SearchServer?" + urlencode({
+        "searchText": postcode[1], "type": "locations", "origins": "zipcode", "sr": 4326, "limit": 5,
+    }))
+    results = response.get("results") if isinstance(response, dict) else None
+    if not isinstance(results, list) or not results or len(results) >= 5:
+        return False
+    for candidate in results:
+        attrs = candidate.get("attrs", {})
+        label = Document(attrs.get("label", "")).root.text()
+        if (attrs.get("origin") != "zipcode" or attrs.get("detail") != postcode[1]
+                or not address_tokens(listing["city"]).issubset(address_tokens(label))):
+            return False
+        box = re.fullmatch(r"BOX\(([-+\d.]+) ([-+\d.]+),\s*([-+\d.]+) ([-+\d.]+)\)",
+                           attrs.get("geom_st_box2d", ""))
+        if box is None:
+            return False
+        try:
+            west, south, east, north = map(float, box.groups())
+        except ValueError:
+            return False
+        if not (5 <= west < east <= 11 and 45 <= south < north <= 48.5):
+            return False
+        if not (east < bounds["west"] or west > bounds["east"]
+                or north < bounds["south"] or south > bounds["north"]):
+            return False
+    return True
+
+
+def fetch_wgzimmer(client, options, cache, search_bounds=None):
     entries = {}
     for region in options.wgzimmer_regions:
         region = REGION_ALIASES.get(region, region)
@@ -360,7 +393,8 @@ def fetch_wgzimmer(client, options, cache):
         if len(region_ids) < total:
             raise WGZimmerError("wgzimmer returned only {} of {} rooms in {}. Search may be incomplete."
                                 .format(len(region_ids), total, region))
-    listings, removed, unknown_location = [], 0, 0
+    listings, removed, unknown_locations = [], 0, []
+    outside_postcode_count = 0
     for entry in entries.values():
         listing = parse_detail(client.get_text(entry["url"]), entry)
         if listing is None:
@@ -375,8 +409,16 @@ def fetch_wgzimmer(client, options, cache):
                 if point:
                     listing["latitude"], listing["longitude"] = point
                     listing["location_accuracy"] = "geocoded_address"
+                elif postcode_outside_search(client, listing, search_bounds):
+                    outside_postcode_count += 1
                 else:
-                    unknown_location += 1
+                    unknown_locations.append({
+                        "id": "wgzimmer:" + listing["pk"],
+                        "url": listing["url"],
+                        "address": listing["public_address"],
+                        "reason": "No advertised coordinates or verified address geocode",
+                    })
         listings.append(listing)
     return listings, {"candidate_count": len(entries), "details_count": len(listings),
-                      "unavailable_details_count": removed, "unknown_location_count": unknown_location}
+                      "unavailable_details_count": removed, "unknown_location_count": len(unknown_locations),
+                      "unknown_locations": unknown_locations, "outside_postcode_count": outside_postcode_count}

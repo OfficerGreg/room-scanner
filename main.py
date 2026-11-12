@@ -404,7 +404,8 @@ def scan(options, center):
                         LOG.warning("Ignoring unreadable wgzimmer geocoding cache")
                 LOG.info("wgzimmer: scanning regions %s", ", ".join(options.wgzimmer_regions))
                 try:
-                    listings, stats = fetch_wgzimmer(client, options, cache)
+                    listings, stats = fetch_wgzimmer(client, options, cache,
+                                                    search_bounds=bounding_box(center[0], center[1], options.radius_km))
                 finally:
                     if cache:
                         atomic_write(cache_path, json.dumps(cache, ensure_ascii=False, indent=2) + "\n")
